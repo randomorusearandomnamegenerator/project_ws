@@ -40,17 +40,6 @@ DEMERIT_COLUMNS = [
     "Debarment phase and period",
 ]
 
-API_COLUMNS = [
-    "UEN",
-    "Company Name",
-    "Number of Fatal Cases",
-    "Bizsafe Awards",
-    "WSH Awards",
-    "Bizsafe",
-    "Is under BUS",
-    "BUS Entry Date",
-    "Updated On",
-]
 
 UEN_PATTERN = re.compile(r"\b([0-9]{8,9})\s*([A-Z])\b")
 
@@ -67,6 +56,11 @@ def normalize_text(value: str) -> str:
 def normalize_company_name(value: str) -> str:
     cleaned = re.sub(r"[^a-z0-9 ]+", " ", value.lower())
     return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def safe_filename(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_")
+    return cleaned or "file"
 
 
 def extract_uen(text: str) -> Optional[str]:
@@ -152,26 +146,32 @@ def resolve_pdf_url(url: str) -> Tuple[str, bytes]:
     return pdf_url, pdf_response.content
 
 
-def download_pdfs() -> Tuple[Dict[str, Any], List[str]]:
+def download_pdfs() -> Tuple[Dict[str, Any], List[str], str, str]:
     ensure_dirs()
     pdf_info: Dict[str, Any] = {}
     errors: List[str] = []
+    bundle_dt = datetime.now()
+    bundle_display = bundle_dt.strftime("%Y-%m-%d %H:%M:%S")
+    bundle_stamp = bundle_dt.strftime("%Y%m%d_%H%M%S")
 
     for key, meta in PDF_SOURCES.items():
         try:
             resolved_url, content = resolve_pdf_url(meta["url"])
             file_path = PDF_DIR / f"{key}.pdf"
             file_path.write_bytes(content)
+            retrieved_dt = datetime.now()
             pdf_info[key] = {
                 "label": meta["label"],
                 "source_url": meta["url"],
                 "resolved_url": resolved_url,
                 "path": file_path,
+                "retrieved_at": retrieved_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "retrieved_at_stamp": retrieved_dt.strftime("%Y%m%d_%H%M%S"),
             }
         except Exception as exc:  # noqa: BLE001 - surface download errors in UI
             errors.append(f"{meta['label']}: {exc}")
 
-    return pdf_info, errors
+    return pdf_info, errors, bundle_display, bundle_stamp
 
 
 def parse_updated_on(lines: List[str]) -> Optional[str]:
@@ -377,20 +377,38 @@ def parse_uens(raw: str) -> List[str]:
     return list(dict.fromkeys(uens))
 
 
-def create_zip_bytes(pdf_info: Dict[str, Any]) -> Tuple[str, bytes]:
+def create_zip_bytes(pdf_info: Dict[str, Any], bundle_stamp: str) -> Tuple[str, bytes]:
     ensure_dirs()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    zip_name = f"mom_pdfs_{timestamp}.zip"
+    zip_name = f"mom_pdfs_{bundle_stamp}.zip"
 
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         for meta in pdf_info.values():
-            stem = meta["path"].stem
+            label = safe_filename(meta.get("label", meta["path"].stem))
             suffix = meta["path"].suffix
-            stamped_name = f"{stem}_{timestamp}{suffix}"
+            file_stamp = meta.get("retrieved_at_stamp", bundle_stamp)
+            stamped_name = f"{label}_{file_stamp}{suffix}"
             zf.write(meta["path"], stamped_name)
 
     return zip_name, buffer.getvalue()
+
+
+def load_pdf_bundle() -> Dict[str, Any]:
+    if "pdf_bundle" in st.session_state:
+        return st.session_state["pdf_bundle"]
+
+    pdf_info, errors, bundle_display, bundle_stamp = download_pdfs()
+    zip_name, zip_bytes = create_zip_bytes(pdf_info, bundle_stamp) if pdf_info else (None, None)
+    bundle = {
+        "pdf_info": pdf_info,
+        "errors": errors,
+        "bundle_display": bundle_display,
+        "bundle_stamp": bundle_stamp,
+        "zip_name": zip_name,
+        "zip_bytes": zip_bytes,
+    }
+    st.session_state["pdf_bundle"] = bundle
+    return bundle
 
 
 def build_results(
@@ -509,6 +527,34 @@ def render_app() -> None:
         "reports which companies meet the configured criteria."
     )
 
+    with st.spinner("Fetching MOM PDFs for download..."):
+        pdf_bundle = load_pdf_bundle()
+
+    st.subheader("PDF downloads")
+    st.markdown(f"**Retrieved at:** {pdf_bundle['bundle_display']}")
+    if pdf_bundle.get("zip_name") and pdf_bundle.get("zip_bytes"):
+        st.download_button(
+            "Download PDFs (ZIP)",
+            data=pdf_bundle["zip_bytes"],
+            file_name=pdf_bundle["zip_name"],
+            mime="application/zip",
+        )
+
+    if pdf_bundle.get("pdf_info"):
+        retrieval_rows = [
+            {
+                "PDF": meta.get("label", key),
+                "Retrieved at": meta.get("retrieved_at", "-"),
+            }
+            for key, meta in pdf_bundle["pdf_info"].items()
+        ]
+        st.dataframe(retrieval_rows, use_container_width=True)
+
+    if pdf_bundle.get("errors"):
+        st.warning("Download warnings:")
+        for err in pdf_bundle["errors"]:
+            st.write(f"- {err}")
+
     defaults = {
         "demerit_threshold": 50,
         "fatal_cases_limit": 0,
@@ -545,6 +591,10 @@ def render_app() -> None:
     if not submitted:
         return
 
+    if not pdf_bundle.get("pdf_info"):
+        st.error("PDFs could not be downloaded. Please check the warnings above and try again.")
+        return
+
     uens = parse_uens(uens_input)
     if not uens:
         st.warning("Please enter at least one UEN.")
@@ -556,8 +606,8 @@ def render_app() -> None:
         "exclude_bus": exclude_bus,
     }
 
-    with st.spinner("Downloading and parsing MOM PDFs..."):
-        pdf_info, errors = download_pdfs()
+    pdf_info = pdf_bundle["pdf_info"]
+    with st.spinner("Parsing MOM PDFs..."):
         demerit = parse_demerit_pdf(pdf_info["demerit"]["path"]) if "demerit" in pdf_info else {}
         bus = parse_bus_pdf(pdf_info["bus"]["path"]) if "bus" in pdf_info else {}
         swo = parse_swo_pdf(pdf_info["swo"]["path"]) if "swo" in pdf_info else {}
@@ -572,26 +622,13 @@ def render_app() -> None:
                 break
 
         results = build_results(uens, demerit, bus, swo, criteria)
-        zip_name, zip_bytes = create_zip_bytes(pdf_info) if pdf_info else (None, None)
 
     st.divider()
     st.markdown(
         f"**Current Date and Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  ",
     )
+    st.markdown(f"**PDFs Retrieved at:** {pdf_bundle['bundle_display']}")
     st.markdown(f"**Updated on:** {updated_on or 'Unknown'}")
-
-    if zip_name and zip_bytes:
-        st.download_button(
-            "Download PDFs (ZIP)",
-            data=zip_bytes,
-            file_name=zip_name,
-            mime="application/zip",
-        )
-
-    if errors:
-        st.warning("Download warnings:")
-        for err in errors:
-            st.write(f"- {err}")
 
     if pdf_info:
         st.subheader("Data status")
@@ -604,10 +641,6 @@ def render_app() -> None:
 
     st.subheader("Columns from MOM PDF Demerit Points PDF")
     st.write([f"{idx}: \"{col}\"" for idx, col in enumerate(DEMERIT_COLUMNS)])
-
-    st.subheader("Columns from MOM API")
-    st.caption("API data is not available; fields are shown for reference.")
-    st.write([f"{idx}: \"{col}\"" for idx, col in enumerate(API_COLUMNS)])
 
     st.subheader("Criteria applied")
     st.write(results["criteria_checks"])
