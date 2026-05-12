@@ -7,6 +7,7 @@ from urllib.parse import urljoin
 import io
 import re
 import zipfile
+from zoneinfo import ZoneInfo
 
 import pdfplumber
 import requests
@@ -17,6 +18,7 @@ APP_ROOT = Path(__file__).parent
 DATA_DIR = APP_ROOT / "data"
 PDF_DIR = DATA_DIR / "pdfs"
 DOWNLOAD_DIR = DATA_DIR / "downloads"
+SG_TZ = ZoneInfo("Asia/Singapore")
 
 PDF_SOURCES = {
     "demerit": {
@@ -51,6 +53,10 @@ def ensure_dirs() -> None:
 
 def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value.strip().lower())
+
+
+def now_sg() -> datetime:
+    return datetime.now(tz=SG_TZ)
 
 
 def normalize_company_name(value: str) -> str:
@@ -150,7 +156,7 @@ def download_pdfs() -> Tuple[Dict[str, Any], List[str], str, str]:
     ensure_dirs()
     pdf_info: Dict[str, Any] = {}
     errors: List[str] = []
-    bundle_dt = datetime.now()
+    bundle_dt = now_sg()
     bundle_display = bundle_dt.strftime("%Y-%m-%d %H:%M:%S")
     bundle_stamp = bundle_dt.strftime("%Y%m%d_%H%M%S")
 
@@ -159,7 +165,7 @@ def download_pdfs() -> Tuple[Dict[str, Any], List[str], str, str]:
             resolved_url, content = resolve_pdf_url(meta["url"])
             file_path = PDF_DIR / f"{key}.pdf"
             file_path.write_bytes(content)
-            retrieved_dt = datetime.now()
+            retrieved_dt = now_sg()
             pdf_info[key] = {
                 "label": meta["label"],
                 "source_url": meta["url"],
@@ -625,7 +631,7 @@ def render_app() -> None:
 
     st.divider()
     st.markdown(
-        f"**Current Date and Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  ",
+        f"**Current Date and Time:** {now_sg().strftime('%Y-%m-%d %H:%M:%S')}  ",
     )
     st.markdown(f"**PDFs Retrieved at:** {pdf_bundle['bundle_display']}")
     st.markdown(f"**Updated on:** {updated_on or 'Unknown'}")
