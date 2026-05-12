@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WSH Scraper</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="page">
+      <header class="hero">
+        <div class="hero-badge">WSH Scraper</div>
+        <h1>MOM Company Info Scraper</h1>
+        <p>
+          This tool downloads the three MOM PDFs, extracts data by UEN, and
+          reports which companies meet the configured criteria.
+        </p>
+      </header>
+
+      <section class="panel">
+        <h2>Webscraper (MOM)</h2>
+        <form method="post">
+          <label for="uens">Enter your list of UENs (separated by commas):</label>
+          <textarea id="uens" name="uens" rows="3" placeholder="199403976M, 53146389C">{{ input_uens }}</textarea>
+
+          <div class="criteria">
+            <h3>Criteria used for filtering</h3>
+            <div class="criteria-grid">
+              <label>
+                Demerit points less than
+                <input type="number" name="demerit_threshold" value="{{ criteria.demerit_threshold }}" />
+              </label>
+              <label>
+                Fatal cases equal to
+                <input type="number" name="fatal_cases_limit" value="{{ criteria.fatal_cases_limit if criteria.fatal_cases_limit is not none else '' }}" />
+                <span class="muted">(API not available)</span>
+              </label>
+              <label class="checkbox">
+                <input type="checkbox" name="exclude_bus" {% if criteria.exclude_bus %}checked{% endif %} />
+                Exclude companies under BUS
+              </label>
+            </div>
+          </div>
+
+          <button type="submit">Run Scraper</button>
+        </form>
+      </section>
+
+      {% if results %}
+      <section class="panel">
+        <div class="meta">
+          <div><strong>Current Date and Time:</strong> {{ now }}</div>
+          <div><strong>Updated on:</strong> {{ updated_on|default("Unknown") }}</div>
+        </div>
+        {% if download_name %}
+        <a class="download" href="/download/{{ download_name }}">Download PDFs (ZIP)</a>
+        {% endif %}
+
+        {% if errors %}
+        <div class="notice">
+          <strong>Download warnings:</strong>
+          <ul>
+            {% for err in errors %}
+            <li>{{ err }}</li>
+            {% endfor %}
+          </ul>
+        </div>
+        {% endif %}
+
+        {% if stats %}
+        <div class="data-status">
+          <div>
+            <strong>Parsed rows:</strong>
+            Demerit {{ stats.demerit_count }}, BUS {{ stats.bus_count }}, SWO {{ stats.swo_count }}
+          </div>
+          <div>
+            <strong>Resolved PDF URLs:</strong>
+            <ul>
+              {% for key, url in stats.resolved.items() %}
+              <li>{{ key }}: {{ url }}</li>
+              {% endfor %}
+            </ul>
+          </div>
+        </div>
+        {% endif %}
+
+        <div class="columns">
+          <div>
+            <h4>Columns from MOM PDF Demerit Points PDF</h4>
+            <ul>
+              {% for col in demerit_columns %}
+              <li>{{ loop.index0 }}: "{{ col }}"</li>
+              {% endfor %}
+            </ul>
+          </div>
+          <div>
+            <h4>Columns from MOM API</h4>
+            <p class="muted">API data is not available; fields are shown for reference.</p>
+            <ul>
+              {% for col in api_columns %}
+              <li>{{ loop.index0 }}: "{{ col }}"</li>
+              {% endfor %}
+            </ul>
+          </div>
+        </div>
+
+        <div class="criteria-summary">
+          <h4>Criteria applied</h4>
+          <ul>
+            {% for item in results.criteria_checks %}
+            <li>{{ item }}</li>
+            {% endfor %}
+          </ul>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h3>List of companies that meets criteria</h3>
+        {% if results.meets %}
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>UEN</th>
+                <th>Company Name</th>
+                <th>Demerit Points</th>
+                <th>Debarment Phase/Period</th>
+                <th>Is under BUS</th>
+                <th>BUS Entry Date</th>
+                <th>SWO Count</th>
+                <th>Notes</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in results.meets %}
+              <tr>
+                <td>{{ row.uen }}</td>
+                <td>{{ row.name|default('-') }}</td>
+                <td>{{ row.demerit_points|fmt }}</td>
+                <td>{{ row.debarment|fmt }}</td>
+                <td>{{ row.is_under_bus|fmt }}</td>
+                <td>{{ row.bus_entry_date|fmt }}</td>
+                <td>{{ row.swo_count|fmt }}</td>
+                <td>{{ row.notes|fmt }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% else %}
+        <p class="muted">No companies met the criteria.</p>
+        {% endif %}
+      </section>
+
+      <section class="panel">
+        <h3>List of companies that did not meet criteria</h3>
+        {% if results.not_meet %}
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>UEN</th>
+                <th>Company Name</th>
+                <th>Demerit Points</th>
+                <th>Debarment Phase/Period</th>
+                <th>Is under BUS</th>
+                <th>BUS Entry Date</th>
+                <th>SWO Count</th>
+                <th>Notes</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in results.not_meet %}
+              <tr>
+                <td>{{ row.uen }}</td>
+                <td>{{ row.name|default('-') }}</td>
+                <td>{{ row.demerit_points|fmt }}</td>
+                <td>{{ row.debarment|fmt }}</td>
+                <td>{{ row.is_under_bus|fmt }}</td>
+                <td>{{ row.bus_entry_date|fmt }}</td>
+                <td>{{ row.swo_count|fmt }}</td>
+                <td>{{ row.notes|fmt }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% else %}
+        <p class="muted">All companies met the criteria.</p>
+        {% endif %}
+      </section>
+      {% endif %}
+
+      <footer class="footer">
+        <p>Built for SharePoint embed use. PDF data sourced from MOM public links.</p>
+      </footer>
+    </div>
+  </body>
+</html>
