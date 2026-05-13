@@ -42,6 +42,17 @@ DEMERIT_COLUMNS = [
     "Debarment phase and period",
 ]
 
+RESULT_COLUMNS = [
+    "UEN",
+    "Company Name",
+    "Demerit Points",
+    "Debarment Phase/Period",
+    "Is under BUS",
+    "BUS Entry Date",
+    "SWO Count",
+    "Notes",
+]
+
 
 UEN_PATTERN = re.compile(r"\b([0-9]{8,9})\s*([A-Z])\b")
 
@@ -426,17 +437,9 @@ def build_results(
 ) -> Dict[str, Any]:
     results: List[Dict[str, Any]] = []
     criteria_checks = []
-    fatal_cases_available = False
 
     if criteria.get("demerit_threshold") is not None:
         criteria_checks.append(f"Number of demerit points < {criteria['demerit_threshold']}")
-    if criteria.get("fatal_cases_limit") is not None:
-        if fatal_cases_available:
-            criteria_checks.append(f"Number of Fatal Cases = {criteria['fatal_cases_limit']}")
-        else:
-            criteria_checks.append(
-                f"Number of Fatal Cases = {criteria['fatal_cases_limit']} (skipped - API unavailable)"
-            )
     if criteria.get("exclude_bus"):
         criteria_checks.append("NOT Under BUS")
 
@@ -448,6 +451,7 @@ def build_results(
         swo_row = swo.get(swo_key, {}) if swo_key else {}
 
         demerit_points = demerit_row.get("demerit_points")
+        demerit_found = demerit_points is not None
         if demerit_points is None:
             demerit_points = 0
         is_under_bus = uen in bus
@@ -471,6 +475,7 @@ def build_results(
                 "uen": uen,
                 "name": company_name or swo_row.get("name") or "",
                 "demerit_points": demerit_points,
+                "demerit_found": demerit_found,
                 "debarment": demerit_row.get("debarment", ""),
                 "is_under_bus": is_under_bus,
                 "bus_entry_date": bus_row.get("entry_date", ""),
@@ -487,7 +492,6 @@ def build_results(
         "meets": meets,
         "not_meet": not_meet,
         "criteria_checks": criteria_checks,
-        "fatal_cases_available": fatal_cases_available,
     }
 
 
@@ -517,12 +521,53 @@ def format_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     return formatted
 
 
-def render_table(title: str, rows: List[Dict[str, Any]], empty_message: str) -> None:
+def apply_result_filters(rows: List[Dict[str, Any]], filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+    filtered: List[Dict[str, Any]] = []
+    name_query = normalize_company_name(filters.get("name_query", ""))
+    uen_query = filters.get("uen_query", "").strip().upper()
+
+    for row in rows:
+        if filters.get("only_bus") and not row.get("is_under_bus"):
+            continue
+        if filters.get("demerit_missing_only") and row.get("demerit_found", False):
+            continue
+        min_demerit = filters.get("min_demerit")
+        if min_demerit is not None and row.get("demerit_points", 0) < min_demerit:
+            continue
+        min_swo = filters.get("min_swo")
+        if min_swo is not None:
+            swo_count = row.get("swo_count") or 0
+            if swo_count < min_swo:
+                continue
+        if name_query:
+            if name_query not in normalize_company_name(row.get("name", "")):
+                continue
+        if uen_query:
+            if uen_query not in str(row.get("uen", "")).upper():
+                continue
+        filtered.append(row)
+
+    return filtered
+
+
+def render_table(
+    title: str,
+    rows: List[Dict[str, Any]],
+    empty_message: str,
+    columns: Optional[List[str]] = None,
+) -> None:
     st.subheader(title)
-    if rows:
-        st.dataframe(format_rows(rows), use_container_width=True)
-    else:
+    if not rows:
         st.info(empty_message)
+        return
+
+    formatted = format_rows(rows)
+    if columns:
+        formatted = [
+            {column: row.get(column, "-") for column in columns}
+            for row in formatted
+        ]
+    st.dataframe(formatted, use_container_width=True)
 
 
 def render_app() -> None:
@@ -563,7 +608,6 @@ def render_app() -> None:
 
     defaults = {
         "demerit_threshold": 50,
-        "fatal_cases_limit": 0,
         "exclude_bus": True,
     }
 
@@ -583,14 +627,9 @@ def render_app() -> None:
                 step=1,
             )
         with col2:
-            fatal_cases_limit = st.number_input(
-                "Fatal cases equal to (API not available)",
-                min_value=0,
-                value=defaults["fatal_cases_limit"],
-                step=1,
-            )
-        with col3:
             exclude_bus = st.checkbox("Exclude companies under BUS", value=defaults["exclude_bus"])
+        with col3:
+            st.caption("Fields are based on the MOM PDFs only.")
 
         submitted = st.form_submit_button("Run Scraper")
 
@@ -608,7 +647,6 @@ def render_app() -> None:
 
     criteria = {
         "demerit_threshold": int(demerit_threshold),
-        "fatal_cases_limit": int(fatal_cases_limit),
         "exclude_bus": exclude_bus,
     }
 
@@ -651,16 +689,52 @@ def render_app() -> None:
     st.subheader("Criteria applied")
     st.write(results["criteria_checks"])
 
+    st.caption(
+        "Demerit points shown as 0 mean the UEN was not found in the demerit points PDF."
+    )
+
+    st.subheader("Result filters")
+    filter_col1, filter_col2, filter_col3 = st.columns(3)
+    with filter_col1:
+        only_bus = st.checkbox("Show only companies under BUS", value=False)
+        min_demerit = st.number_input("Minimum demerit points", min_value=0, value=0, step=1)
+    with filter_col2:
+        min_swo = st.number_input("Minimum SWO count", min_value=0, value=0, step=1)
+        demerit_missing_only = st.checkbox("Show only demerit not found (0)", value=False)
+    with filter_col3:
+        name_query = st.text_input("Company name contains", value="")
+        uen_query = st.text_input("UEN contains", value="")
+
+    selected_columns = st.multiselect(
+        "Columns to display",
+        options=RESULT_COLUMNS,
+        default=RESULT_COLUMNS,
+    )
+
+    filter_config = {
+        "only_bus": only_bus,
+        "min_demerit": min_demerit,
+        "min_swo": min_swo,
+        "demerit_missing_only": demerit_missing_only,
+        "name_query": name_query,
+        "uen_query": uen_query,
+    }
+
+    filtered_meets = apply_result_filters(results["meets"], filter_config)
+    filtered_not_meet = apply_result_filters(results["not_meet"], filter_config)
+
     render_table(
         "List of companies that meet criteria",
-        results["meets"],
+        filtered_meets,
         "No companies met the criteria.",
+        columns=selected_columns,
     )
 
     render_table(
         "List of companies that did not meet criteria",
-        results["not_meet"],
+        filtered_not_meet,
         "All companies met the criteria.",
+        columns=selected_columns,
     )
 
     st.caption("Built for SharePoint embed use. PDF data sourced from MOM public links.")
