@@ -44,7 +44,7 @@ DEMERIT_COLUMNS = [
 
 
 
-UEN_PATTERN = re.compile(r"\b([0-9]{8,9})\s*([A-Z])\b")
+UEN_PATTERN = re.compile(r"[A-Za-z0-9]{8,12}")
 
 
 def ensure_dirs() -> None:
@@ -70,11 +70,24 @@ def safe_filename(value: str) -> str:
     return cleaned or "file"
 
 
+def is_uen_candidate(value: str) -> bool:
+    return any(ch.isdigit() for ch in value) and any(ch.isalpha() for ch in value)
+
+
 def extract_uen(text: str) -> Optional[str]:
-    match = UEN_PATTERN.search(text or "")
-    if not match:
+    if not text:
         return None
-    return f"{match.group(1)}{match.group(2)}"
+
+    for candidate in UEN_PATTERN.findall(text):
+        if is_uen_candidate(candidate):
+            return candidate.upper()
+
+    compact = re.sub(r"\s+", "", text)
+    for candidate in UEN_PATTERN.findall(compact):
+        if is_uen_candidate(candidate):
+            return candidate.upper()
+
+    return None
 
 
 def parse_int(value: str) -> Optional[int]:
@@ -645,7 +658,7 @@ def render_app() -> None:
     st.write(results["criteria_checks"])
 
     st.caption(
-        "Demerit points shown as 0 mean the UEN was not found in the demerit points PDF."
+        "Demerit points shown as 0 mean the UEN was not found in the demerit points PDF. However, it may still be found in the BUS or SWO PDFs, which can be checked in the respective columns. Notes explain which criteria were not met based on the PDF data only."
     )
 
     render_table(
