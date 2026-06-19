@@ -1,45 +1,22 @@
 from __future__ import annotations
 
 from datetime import datetime
-
-FILTER_CONFIG = {
-    "demerit_points": {
-        "enabled": True,
-        "max_points": 50,
-    },
-    "debarment": {
-        "enabled": True,
-        "mode": "must_be_blank",
-        "allowed_values": [],
-    },
-    "under_bus": {
-        "enabled": True,
-        "exclude_under_bus": True,
-    },
-    "swo": {
-        "enabled": True,
-        "max_count": 0,
-    },
-}
-
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 import io
 import re
 import zipfile
-from zoneinfo import ZoneInfo
 
 import pdfplumber
 import requests
-import streamlit as st
 from bs4 import BeautifulSoup
+from flask import Flask, render_template, request, send_file
 
 APP_ROOT = Path(__file__).parent
 DATA_DIR = APP_ROOT / "data"
 PDF_DIR = DATA_DIR / "pdfs"
 DOWNLOAD_DIR = DATA_DIR / "downloads"
-SG_TZ = ZoneInfo("Asia/Singapore")
 
 PDF_SOURCES = {
     "demerit": {
@@ -63,9 +40,21 @@ DEMERIT_COLUMNS = [
     "Debarment phase and period",
 ]
 
+API_COLUMNS = [
+    "UEN",
+    "Company Name",
+    "Number of Fatal Cases",
+    "Bizsafe Awards",
+    "WSH Awards",
+    "Bizsafe",
+    "Is under BUS",
+    "BUS Entry Date",
+    "Updated On",
+]
 
+UEN_PATTERN = re.compile(r"\b([0-9]{8,9})\s*([A-Z])\b")
 
-UEN_PATTERN = re.compile(r"[A-Za-z0-9]{8,12}")
+app = Flask(__name__)
 
 
 def ensure_dirs() -> None:
@@ -77,38 +66,16 @@ def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value.strip().lower())
 
 
-def now_sg() -> datetime:
-    return datetime.now(tz=SG_TZ)
-
-
 def normalize_company_name(value: str) -> str:
     cleaned = re.sub(r"[^a-z0-9 ]+", " ", value.lower())
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
-def safe_filename(value: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_")
-    return cleaned or "file"
-
-
-def is_uen_candidate(value: str) -> bool:
-    return any(ch.isdigit() for ch in value) and any(ch.isalpha() for ch in value)
-
-
 def extract_uen(text: str) -> Optional[str]:
-    if not text:
+    match = UEN_PATTERN.search(text or "")
+    if not match:
         return None
-
-    for candidate in UEN_PATTERN.findall(text):
-        if is_uen_candidate(candidate):
-            return candidate.upper()
-
-    compact = re.sub(r"\s+", "", text)
-    for candidate in UEN_PATTERN.findall(compact):
-        if is_uen_candidate(candidate):
-            return candidate.upper()
-
-    return None
+    return f"{match.group(1)}{match.group(2)}"
 
 
 def parse_int(value: str) -> Optional[int]:
@@ -116,18 +83,6 @@ def parse_int(value: str) -> Optional[int]:
         return None
     digits = re.findall(r"\d+", value.replace(",", ""))
     return int(digits[0]) if digits else None
-
-
-def parse_swo_count(value: Optional[str]) -> int:
-    if value is None:
-        return 0
-
-    normalized = value.strip()
-    if not normalized or normalized == "-":
-        return 0
-
-    parsed = parse_int(normalized)
-    return parsed if parsed is not None else 1
 
 
 def extract_tables(pdf_path: Path) -> List[List[List[str]]]:
@@ -199,32 +154,26 @@ def resolve_pdf_url(url: str) -> Tuple[str, bytes]:
     return pdf_url, pdf_response.content
 
 
-def download_pdfs() -> Tuple[Dict[str, Any], List[str], str, str]:
+def download_pdfs() -> Tuple[Dict[str, Any], List[str]]:
     ensure_dirs()
     pdf_info: Dict[str, Any] = {}
     errors: List[str] = []
-    bundle_dt = now_sg()
-    bundle_display = bundle_dt.strftime("%Y-%m-%d %H:%M:%S")
-    bundle_stamp = bundle_dt.strftime("%Y%m%d_%H%M%S")
 
     for key, meta in PDF_SOURCES.items():
         try:
             resolved_url, content = resolve_pdf_url(meta["url"])
             file_path = PDF_DIR / f"{key}.pdf"
             file_path.write_bytes(content)
-            retrieved_dt = now_sg()
             pdf_info[key] = {
                 "label": meta["label"],
                 "source_url": meta["url"],
                 "resolved_url": resolved_url,
                 "path": file_path,
-                "retrieved_at": retrieved_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                "retrieved_at_stamp": retrieved_dt.strftime("%Y%m%d_%H%M%S"),
             }
         except Exception as exc:  # noqa: BLE001 - surface download errors in UI
             errors.append(f"{meta['label']}: {exc}")
 
-    return pdf_info, errors, bundle_display, bundle_stamp
+    return pdf_info, errors
 
 
 def parse_updated_on(lines: List[str]) -> Optional[str]:
@@ -372,7 +321,6 @@ def parse_bus_pdf(pdf_path: Path) -> Dict[str, Dict[str, Any]]:
 def parse_swo_pdf(pdf_path: Path) -> Dict[str, Dict[str, Any]]:
     header_map = {
         "name": ["name of company", "company name", "company", "name"],
-        "count": ["count", "number", "no. of", "no of", "swo"],
     }
     records: Dict[str, Dict[str, Any]] = {}
 
@@ -395,11 +343,8 @@ def parse_swo_pdf(pdf_path: Path) -> Dict[str, Dict[str, Any]]:
                 normalized = normalize_company_name(name)
                 if not normalized:
                     continue
-                count = 1
-                if len(row) > 2:
-                    count = parse_swo_count(row[-1])
                 existing = records.get(normalized, {"name": name.strip(), "count": 0})
-                existing["count"] += count
+                existing["count"] += 1
                 records[normalized] = existing
             continue
 
@@ -408,11 +353,8 @@ def parse_swo_pdf(pdf_path: Path) -> Dict[str, Dict[str, Any]]:
             normalized = normalize_company_name(name)
             if not normalized:
                 continue
-            count = 1
-            if mapping.get("count") is not None:
-                count = parse_swo_count(row[mapping["count"]])
             existing = records.get(normalized, {"name": name.strip(), "count": 0})
-            existing["count"] += count
+            existing["count"] += 1
             records[normalized] = existing
 
     if records:
@@ -437,98 +379,38 @@ def parse_uens(raw: str) -> List[str]:
     return list(dict.fromkeys(uens))
 
 
-def create_zip_bytes(pdf_info: Dict[str, Any], bundle_stamp: str) -> Tuple[str, bytes]:
+def create_zip(pdf_info: Dict[str, Any]) -> str:
     ensure_dirs()
-    zip_name = f"mom_pdfs_{bundle_stamp}.zip"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_name = f"mom_pdfs_{timestamp}.zip"
+    zip_path = DOWNLOAD_DIR / zip_name
 
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for meta in pdf_info.values():
-            label = safe_filename(meta.get("label", meta["path"].stem))
+            stem = meta["path"].stem
             suffix = meta["path"].suffix
-            file_stamp = meta.get("retrieved_at_stamp", bundle_stamp)
-            stamped_name = f"{label}_{file_stamp}{suffix}"
+            stamped_name = f"{stem}_{timestamp}{suffix}"
             zf.write(meta["path"], stamped_name)
 
-    return zip_name, buffer.getvalue()
+    return zip_name
 
 
-def load_pdf_bundle() -> Dict[str, Any]:
-    if "pdf_bundle" in st.session_state:
-        return st.session_state["pdf_bundle"]
-
-    pdf_info, errors, bundle_display, bundle_stamp = download_pdfs()
-    zip_name, zip_bytes = create_zip_bytes(pdf_info, bundle_stamp) if pdf_info else (None, None)
-    bundle = {
-        "pdf_info": pdf_info,
-        "errors": errors,
-        "bundle_display": bundle_display,
-        "bundle_stamp": bundle_stamp,
-        "zip_name": zip_name,
-        "zip_bytes": zip_bytes,
-    }
-    st.session_state["pdf_bundle"] = bundle
-    return bundle
-
-
-def build_results(
-    uens: List[str],
-    demerit: Dict[str, Any],
-    bus: Dict[str, Any],
-    swo: Dict[str, Any],
-    criteria: Dict[str, Any],
-) -> Dict[str, Any]:
+def build_results(uens: List[str], demerit: Dict[str, Any], bus: Dict[str, Any], swo: Dict[str, Any], criteria: Dict[str, Any]) -> Dict[str, Any]:
     results: List[Dict[str, Any]] = []
     criteria_checks = []
+    fatal_cases_available = False
 
-    criteria_checks.append("Grading: PASS means every enabled filter passes. FAIL means at least one enabled filter fails.")
-    if criteria.get("demerit_points", {}).get("enabled"):
-        criteria_checks.append(f"Demerit points <= {criteria['demerit_points'].get('max_points', 0)}")
-    if criteria.get("debarment", {}).get("enabled"):
-        mode = criteria["debarment"].get("mode", "must_be_blank")
-        if mode == "must_be_blank":
-            criteria_checks.append("Debarment must be blank or '-' ")
-        elif mode == "equals_any":
-            criteria_checks.append(
-                f"Debarment must equal one of: {criteria['debarment'].get('allowed_values', [])}"
-            )
-        elif mode == "contains_any":
-            criteria_checks.append(
-                f"Debarment must contain one of: {criteria['debarment'].get('allowed_values', [])}"
-            )
+    if criteria.get("demerit_threshold") is not None:
+        criteria_checks.append(f"Number of demerit points < {criteria['demerit_threshold']}")
+    if criteria.get("fatal_cases_limit") is not None:
+        if fatal_cases_available:
+            criteria_checks.append(f"Number of Fatal Cases = {criteria['fatal_cases_limit']}")
         else:
-            criteria_checks.append(f"Debarment rule: {mode}")
-    if criteria.get("under_bus", {}).get("enabled"):
-        if criteria["under_bus"].get("exclude_under_bus", True):
-            criteria_checks.append("Must NOT be under BUS")
-        else:
-            criteria_checks.append("Must be under BUS")
-    if criteria.get("swo", {}).get("enabled"):
-        criteria_checks.append(f"SWO count <= {criteria['swo'].get('max_count', 0)} ( '-' is treated as 0 )")
-
-    def evaluate_debarment(debarment_value: str) -> Tuple[bool, str]:
-        rule = criteria.get("debarment", {})
-        if not rule.get("enabled"):
-            return True, ""
-
-        mode = rule.get("mode", "must_be_blank")
-        cleaned = (debarment_value or "").strip()
-        normalized = cleaned.lower()
-
-        if mode == "must_be_blank":
-            passed = cleaned in {"", "-"}
-            return passed, "Debarment is present" if not passed else ""
-
-        allowed_values = [str(value).strip().lower() for value in rule.get("allowed_values", []) if str(value).strip()]
-        if mode == "equals_any":
-            passed = normalized in allowed_values
-            return passed, f"Debarment '{debarment_value}' is not in the allowed list" if not passed else ""
-
-        if mode == "contains_any":
-            passed = any(value in normalized for value in allowed_values)
-            return passed, f"Debarment '{debarment_value}' does not contain any allowed token" if not passed else ""
-
-        return True, ""
+            criteria_checks.append(
+                f"Number of Fatal Cases = {criteria['fatal_cases_limit']} (skipped - API unavailable)"
+            )
+    if criteria.get("exclude_bus"):
+        criteria_checks.append("NOT Under BUS")
 
     for uen in uens:
         demerit_row = demerit.get(uen, {})
@@ -538,65 +420,51 @@ def build_results(
         swo_row = swo.get(swo_key, {}) if swo_key else {}
 
         demerit_points = demerit_row.get("demerit_points")
-        demerit_found = demerit_points is not None
         if demerit_points is None:
             demerit_points = 0
         is_under_bus = uen in bus
-        swo_count = swo_row.get("count") if swo_row else 0
+        swo_count = swo_row.get("count") if swo_row else None
 
-        checks: List[Tuple[str, bool, str]] = []
-        if criteria.get("demerit_points", {}).get("enabled"):
-            max_points = criteria["demerit_points"].get("max_points", 0)
-            passed = demerit_points <= max_points
-            reason = "" if passed else f"Demerit points {demerit_points} exceed the limit of {max_points}"
-            checks.append((f"Demerit points <= {max_points}", passed, reason))
+        checks: List[Tuple[str, bool]] = []
+        if criteria.get("demerit_threshold") is not None:
+            checks.append((
+                f"Demerit points < {criteria['demerit_threshold']}",
+                demerit_points < criteria["demerit_threshold"],
+            ))
 
-        if criteria.get("debarment", {}).get("enabled"):
-            debarment_passed, debarment_reason = evaluate_debarment(str(demerit_row.get("debarment", "")))
-            checks.append(("Debarment rule", debarment_passed, debarment_reason))
+        if criteria.get("exclude_bus"):
+            checks.append(("Not under BUS", not is_under_bus))
 
-        if criteria.get("under_bus", {}).get("enabled"):
-            exclude_under_bus = criteria["under_bus"].get("exclude_under_bus", True)
-            passed = (not is_under_bus) if exclude_under_bus else is_under_bus
-            reason = "Company is listed under BUS" if exclude_under_bus else "Company is not listed under BUS"
-            checks.append(("BUS rule", passed, "" if passed else reason))
-
-        if criteria.get("swo", {}).get("enabled"):
-            max_count = criteria["swo"].get("max_count", 0)
-            passed = swo_count <= max_count
-            reason = "" if passed else f"SWO count {swo_count} exceeds the limit of {max_count}"
-            checks.append((f"SWO count <= {max_count}", passed, reason))
-
-        grade = "PASS" if all(passed for _, passed, _ in checks) else "FAIL"
-        notes = [reason for _, passed, reason in checks if not passed and reason]
+        meets_all = all(result for _, result in checks) if checks else False
+        notes = [label for label, passed in checks if not passed]
 
         results.append(
             {
                 "uen": uen,
                 "name": company_name or swo_row.get("name") or "",
                 "demerit_points": demerit_points,
-                "demerit_found": demerit_found,
                 "debarment": demerit_row.get("debarment", ""),
                 "is_under_bus": is_under_bus,
                 "bus_entry_date": bus_row.get("entry_date", ""),
                 "swo_count": swo_count,
-                "grade": grade,
                 "notes": "; ".join(notes),
             }
         )
 
-    meets = [row for row in results if row["grade"] == "PASS"]
-    not_meet = [row for row in results if row["grade"] == "FAIL"]
+    meets = [row for row in results if not row["notes"]]
+    not_meet = [row for row in results if row["notes"]]
 
     return {
         "rows": results,
         "meets": meets,
         "not_meet": not_meet,
         "criteria_checks": criteria_checks,
+        "fatal_cases_available": fatal_cases_available,
     }
 
 
-def format_cell(value: Any) -> str:
+@app.template_filter("fmt")
+def fmt(value: Any) -> str:
     if value is None or value == "":
         return "-"
     if isinstance(value, bool):
@@ -604,156 +472,79 @@ def format_cell(value: Any) -> str:
     return str(value)
 
 
-def format_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-    formatted: List[Dict[str, str]] = []
-    for row in rows:
-        formatted.append(
-            {
-                "UEN": format_cell(row.get("uen")),
-                "Company Name": format_cell(row.get("name")),
-                "Demerit Points": format_cell(row.get("demerit_points")),
-                "Debarment Phase/Period": format_cell(row.get("debarment")),
-                "Is under BUS": format_cell(row.get("is_under_bus")),
-                "BUS Entry Date": format_cell(row.get("bus_entry_date")),
-                "SWO Count": format_cell(row.get("swo_count")),
-                #"Grade": format_cell(row.get("grade")),
-                "Notes": format_cell(row.get("notes")),
-            }
-        )
-    return formatted
+@app.route("/", methods=["GET", "POST"])
+def index() -> str:
+    defaults = {
+        "demerit_threshold": 50,
+        "fatal_cases_limit": 0,
+        "exclude_bus": True,
+    }
+    context: Dict[str, Any] = {
+        "input_uens": "",
+        "criteria": defaults,
+        "results": None,
+        "errors": [],
+        "now": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_on": None,
+        "pdf_sources": PDF_SOURCES,
+        "download_name": None,
+        "demerit_columns": DEMERIT_COLUMNS,
+        "api_columns": API_COLUMNS,
+        "stats": None,
+    }
+
+    if request.method == "POST":
+        raw_uens = request.form.get("uens", "")
+        context["input_uens"] = raw_uens
+
+        criteria = {
+            "demerit_threshold": parse_int(request.form.get("demerit_threshold", "")) or defaults["demerit_threshold"],
+            "fatal_cases_limit": parse_int(request.form.get("fatal_cases_limit", "")),
+            "exclude_bus": request.form.get("exclude_bus") == "on",
+        }
+        context["criteria"] = criteria
+
+        uens = parse_uens(raw_uens)
+        if uens:
+            pdf_info, errors = download_pdfs()
+            context["errors"] = errors
+
+            demerit = parse_demerit_pdf(pdf_info["demerit"]["path"]) if "demerit" in pdf_info else {}
+            bus = parse_bus_pdf(pdf_info["bus"]["path"]) if "bus" in pdf_info else {}
+            swo = parse_swo_pdf(pdf_info["swo"]["path"]) if "swo" in pdf_info else {}
+
+            updated_on = None
+            for key in ["demerit", "bus", "swo"]:
+                if key not in pdf_info:
+                    continue
+                lines = extract_text_lines(pdf_info[key]["path"])
+                updated_on = parse_updated_on(lines)
+                if updated_on:
+                    break
+            context["updated_on"] = updated_on
+
+            context["results"] = build_results(uens, demerit, bus, swo, criteria)
+            if pdf_info:
+                context["download_name"] = create_zip(pdf_info)
+                context["stats"] = {
+                    "demerit_count": len(demerit),
+                    "bus_count": len(bus),
+                    "swo_count": len(swo),
+                    "resolved": {
+                        key: meta["resolved_url"] for key, meta in pdf_info.items()
+                    },
+                }
+
+    return render_template("index.html", **context)
 
 
-def render_table(
-    title: str,
-    rows: List[Dict[str, Any]],
-    empty_message: str,
-) -> None:
-    st.subheader(title)
-    if not rows:
-        st.info(empty_message)
-        return
-
-    formatted = format_rows(rows)
-    st.dataframe(formatted, use_container_width=True)
-
-
-def render_app() -> None:
-    st.set_page_config(page_title="WSH Scraper", layout="wide")
-    st.title("MOM Company Info Scraper")
-    st.write(
-        "This tool downloads the three MOM PDFs, extracts data by UEN, and "
-        "reports which companies meet the code-defined criteria."
-    )
-
-    with st.spinner("Fetching MOM PDFs for download..."):
-        pdf_bundle = load_pdf_bundle()
-
-    st.subheader("PDF downloads")
-    st.markdown(f"**Retrieved at:** {pdf_bundle['bundle_display']}")
-    if pdf_bundle.get("zip_name") and pdf_bundle.get("zip_bytes"):
-        st.download_button(
-            "Download PDFs (ZIP)",
-            data=pdf_bundle["zip_bytes"],
-            file_name=pdf_bundle["zip_name"],
-            mime="application/zip",
-        )
-
-    if pdf_bundle.get("pdf_info"):
-        retrieval_rows = [
-            {
-                "PDF": meta.get("label", key),
-                "Retrieved at": meta.get("retrieved_at", "-"),
-            }
-            for key, meta in pdf_bundle["pdf_info"].items()
-        ]
-        st.dataframe(retrieval_rows, use_container_width=True)
-
-    if pdf_bundle.get("errors"):
-        st.warning("Download warnings:")
-        for err in pdf_bundle["errors"]:
-            st.write(f"- {err}")
-
-    uens_input = st.text_area(
-        "Enter your list of UENs (separated by commas):",
-        value="",
-        height=90,
-        placeholder="199403976M, 53146389C",
-    )
-    st.caption("Filtering is controlled by the FILTER_CONFIG dictionary in this file.")
-    submitted = st.button("Run Scraper")
-
-    if not submitted:
-        return
-
-    if not pdf_bundle.get("pdf_info"):
-        st.error("PDFs could not be downloaded. Please check the warnings above and try again.")
-        return
-
-    uens = parse_uens(uens_input)
-    if not uens:
-        st.warning("Please enter at least one UEN.")
-        return
-
-    criteria = FILTER_CONFIG
-
-    pdf_info = pdf_bundle["pdf_info"]
-    with st.spinner("Parsing MOM PDFs..."):
-        demerit = parse_demerit_pdf(pdf_info["demerit"]["path"]) if "demerit" in pdf_info else {}
-        bus = parse_bus_pdf(pdf_info["bus"]["path"]) if "bus" in pdf_info else {}
-        swo = parse_swo_pdf(pdf_info["swo"]["path"]) if "swo" in pdf_info else {}
-
-        updated_on = None
-        for key in ["demerit", "bus", "swo"]:
-            if key not in pdf_info:
-                continue
-            lines = extract_text_lines(pdf_info[key]["path"])
-            updated_on = parse_updated_on(lines)
-            if updated_on:
-                break
-
-        results = build_results(uens, demerit, bus, swo, criteria)
-
-    st.divider()
-    st.markdown(
-        f"**Current Date and Time:** {now_sg().strftime('%Y-%m-%d %H:%M:%S')}  ",
-    )
-    st.markdown(f"**PDFs Retrieved at:** {pdf_bundle['bundle_display']}")
-    st.markdown(f"**Updated on:** {updated_on or 'Unknown'}")
-
-    if pdf_info:
-        st.subheader("Data status")
-        st.write(
-            f"Parsed rows: Demerit {len(demerit)}, BUS {len(bus)}, SWO {len(swo)}"
-        )
-        with st.expander("Resolved PDF URLs"):
-            for key, meta in pdf_info.items():
-                st.write(f"{key}: {meta['resolved_url']}")
-
-    st.subheader("Columns from MOM PDF Demerit Points PDF")
-    st.write([f"{idx}: \"{col}\"" for idx, col in enumerate(DEMERIT_COLUMNS)])
-
-    st.subheader("Criteria applied")
-    st.write(results["criteria_checks"])
-    st.caption("Grading is computed from the enabled rules above. PASS means every enabled rule passed; FAIL means at least one rule failed.")
-
-    st.caption(
-        "Demerit points shown as 0 mean the UEN was not found in the demerit points PDF. However, it may still be found in the BUS or SWO PDFs, which can be checked in the respective columns. Notes explain which criteria were not met based on the PDF data only."
-    )
-
-    render_table(
-        "List of companies that meet criteria",
-        results["meets"],
-        "No companies met the criteria.",
-    )
-
-    render_table(
-        "List of companies that did not meet criteria",
-        results["not_meet"],
-        "All companies met the criteria.",
-    )
-
-    st.caption("Built for SharePoint embed use. PDF data sourced from MOM public links.")
+@app.route("/download/<path:filename>")
+def download(filename: str):
+    file_path = DOWNLOAD_DIR / filename
+    if not file_path.exists():
+        return "File not found", 404
+    return send_file(file_path, as_attachment=True)
 
 
 if __name__ == "__main__":
-    render_app()
+    app.run(debug=True)

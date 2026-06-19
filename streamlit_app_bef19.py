@@ -1,27 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-
-FILTER_CONFIG = {
-    "demerit_points": {
-        "enabled": True,
-        "max_points": 50,
-    },
-    "debarment": {
-        "enabled": True,
-        "mode": "must_be_blank",
-        "allowed_values": [],
-    },
-    "under_bus": {
-        "enabled": True,
-        "exclude_under_bus": True,
-    },
-    "swo": {
-        "enabled": True,
-        "max_count": 0,
-    },
-}
-
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin
@@ -116,18 +95,6 @@ def parse_int(value: str) -> Optional[int]:
         return None
     digits = re.findall(r"\d+", value.replace(",", ""))
     return int(digits[0]) if digits else None
-
-
-def parse_swo_count(value: Optional[str]) -> int:
-    if value is None:
-        return 0
-
-    normalized = value.strip()
-    if not normalized or normalized == "-":
-        return 0
-
-    parsed = parse_int(normalized)
-    return parsed if parsed is not None else 1
 
 
 def extract_tables(pdf_path: Path) -> List[List[List[str]]]:
@@ -372,7 +339,6 @@ def parse_bus_pdf(pdf_path: Path) -> Dict[str, Dict[str, Any]]:
 def parse_swo_pdf(pdf_path: Path) -> Dict[str, Dict[str, Any]]:
     header_map = {
         "name": ["name of company", "company name", "company", "name"],
-        "count": ["count", "number", "no. of", "no of", "swo"],
     }
     records: Dict[str, Dict[str, Any]] = {}
 
@@ -395,11 +361,8 @@ def parse_swo_pdf(pdf_path: Path) -> Dict[str, Dict[str, Any]]:
                 normalized = normalize_company_name(name)
                 if not normalized:
                     continue
-                count = 1
-                if len(row) > 2:
-                    count = parse_swo_count(row[-1])
                 existing = records.get(normalized, {"name": name.strip(), "count": 0})
-                existing["count"] += count
+                existing["count"] += 1
                 records[normalized] = existing
             continue
 
@@ -408,11 +371,8 @@ def parse_swo_pdf(pdf_path: Path) -> Dict[str, Dict[str, Any]]:
             normalized = normalize_company_name(name)
             if not normalized:
                 continue
-            count = 1
-            if mapping.get("count") is not None:
-                count = parse_swo_count(row[mapping["count"]])
             existing = records.get(normalized, {"name": name.strip(), "count": 0})
-            existing["count"] += count
+            existing["count"] += 1
             records[normalized] = existing
 
     if records:
@@ -481,54 +441,10 @@ def build_results(
     results: List[Dict[str, Any]] = []
     criteria_checks = []
 
-    criteria_checks.append("Grading: PASS means every enabled filter passes. FAIL means at least one enabled filter fails.")
-    if criteria.get("demerit_points", {}).get("enabled"):
-        criteria_checks.append(f"Demerit points <= {criteria['demerit_points'].get('max_points', 0)}")
-    if criteria.get("debarment", {}).get("enabled"):
-        mode = criteria["debarment"].get("mode", "must_be_blank")
-        if mode == "must_be_blank":
-            criteria_checks.append("Debarment must be blank or '-' ")
-        elif mode == "equals_any":
-            criteria_checks.append(
-                f"Debarment must equal one of: {criteria['debarment'].get('allowed_values', [])}"
-            )
-        elif mode == "contains_any":
-            criteria_checks.append(
-                f"Debarment must contain one of: {criteria['debarment'].get('allowed_values', [])}"
-            )
-        else:
-            criteria_checks.append(f"Debarment rule: {mode}")
-    if criteria.get("under_bus", {}).get("enabled"):
-        if criteria["under_bus"].get("exclude_under_bus", True):
-            criteria_checks.append("Must NOT be under BUS")
-        else:
-            criteria_checks.append("Must be under BUS")
-    if criteria.get("swo", {}).get("enabled"):
-        criteria_checks.append(f"SWO count <= {criteria['swo'].get('max_count', 0)} ( '-' is treated as 0 )")
-
-    def evaluate_debarment(debarment_value: str) -> Tuple[bool, str]:
-        rule = criteria.get("debarment", {})
-        if not rule.get("enabled"):
-            return True, ""
-
-        mode = rule.get("mode", "must_be_blank")
-        cleaned = (debarment_value or "").strip()
-        normalized = cleaned.lower()
-
-        if mode == "must_be_blank":
-            passed = cleaned in {"", "-"}
-            return passed, "Debarment is present" if not passed else ""
-
-        allowed_values = [str(value).strip().lower() for value in rule.get("allowed_values", []) if str(value).strip()]
-        if mode == "equals_any":
-            passed = normalized in allowed_values
-            return passed, f"Debarment '{debarment_value}' is not in the allowed list" if not passed else ""
-
-        if mode == "contains_any":
-            passed = any(value in normalized for value in allowed_values)
-            return passed, f"Debarment '{debarment_value}' does not contain any allowed token" if not passed else ""
-
-        return True, ""
+    if criteria.get("demerit_threshold") is not None:
+        criteria_checks.append(f"Number of demerit points < {criteria['demerit_threshold']}")
+    if criteria.get("exclude_bus"):
+        criteria_checks.append("NOT Under BUS")
 
     for uen in uens:
         demerit_row = demerit.get(uen, {})
@@ -542,33 +458,20 @@ def build_results(
         if demerit_points is None:
             demerit_points = 0
         is_under_bus = uen in bus
-        swo_count = swo_row.get("count") if swo_row else 0
+        swo_count = swo_row.get("count") if swo_row else None
 
-        checks: List[Tuple[str, bool, str]] = []
-        if criteria.get("demerit_points", {}).get("enabled"):
-            max_points = criteria["demerit_points"].get("max_points", 0)
-            passed = demerit_points <= max_points
-            reason = "" if passed else f"Demerit points {demerit_points} exceed the limit of {max_points}"
-            checks.append((f"Demerit points <= {max_points}", passed, reason))
+        checks: List[Tuple[str, bool]] = []
+        if criteria.get("demerit_threshold") is not None:
+            checks.append((
+                f"Demerit points < {criteria['demerit_threshold']}",
+                demerit_points < criteria["demerit_threshold"],
+            ))
 
-        if criteria.get("debarment", {}).get("enabled"):
-            debarment_passed, debarment_reason = evaluate_debarment(str(demerit_row.get("debarment", "")))
-            checks.append(("Debarment rule", debarment_passed, debarment_reason))
+        if criteria.get("exclude_bus"):
+            checks.append(("Under BUS", not is_under_bus))
 
-        if criteria.get("under_bus", {}).get("enabled"):
-            exclude_under_bus = criteria["under_bus"].get("exclude_under_bus", True)
-            passed = (not is_under_bus) if exclude_under_bus else is_under_bus
-            reason = "Company is listed under BUS" if exclude_under_bus else "Company is not listed under BUS"
-            checks.append(("BUS rule", passed, "" if passed else reason))
-
-        if criteria.get("swo", {}).get("enabled"):
-            max_count = criteria["swo"].get("max_count", 0)
-            passed = swo_count <= max_count
-            reason = "" if passed else f"SWO count {swo_count} exceeds the limit of {max_count}"
-            checks.append((f"SWO count <= {max_count}", passed, reason))
-
-        grade = "PASS" if all(passed for _, passed, _ in checks) else "FAIL"
-        notes = [reason for _, passed, reason in checks if not passed and reason]
+        meets_all = all(result for _, result in checks) if checks else False
+        notes = [label for label, passed in checks if not passed]
 
         results.append(
             {
@@ -580,13 +483,12 @@ def build_results(
                 "is_under_bus": is_under_bus,
                 "bus_entry_date": bus_row.get("entry_date", ""),
                 "swo_count": swo_count,
-                "grade": grade,
                 "notes": "; ".join(notes),
             }
         )
 
-    meets = [row for row in results if row["grade"] == "PASS"]
-    not_meet = [row for row in results if row["grade"] == "FAIL"]
+    meets = [row for row in results if not row["notes"]]
+    not_meet = [row for row in results if row["notes"]]
 
     return {
         "rows": results,
@@ -616,7 +518,6 @@ def format_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
                 "Is under BUS": format_cell(row.get("is_under_bus")),
                 "BUS Entry Date": format_cell(row.get("bus_entry_date")),
                 "SWO Count": format_cell(row.get("swo_count")),
-                #"Grade": format_cell(row.get("grade")),
                 "Notes": format_cell(row.get("notes")),
             }
         )
@@ -642,7 +543,7 @@ def render_app() -> None:
     st.title("MOM Company Info Scraper")
     st.write(
         "This tool downloads the three MOM PDFs, extracts data by UEN, and "
-        "reports which companies meet the code-defined criteria."
+        "reports which companies meet the configured criteria."
     )
 
     with st.spinner("Fetching MOM PDFs for download..."):
@@ -673,14 +574,32 @@ def render_app() -> None:
         for err in pdf_bundle["errors"]:
             st.write(f"- {err}")
 
-    uens_input = st.text_area(
-        "Enter your list of UENs (separated by commas):",
-        value="",
-        height=90,
-        placeholder="199403976M, 53146389C",
-    )
-    st.caption("Filtering is controlled by the FILTER_CONFIG dictionary in this file.")
-    submitted = st.button("Run Scraper")
+    defaults = {
+        "demerit_threshold": 50,
+        "exclude_bus": True,
+    }
+
+    with st.form("criteria_form"):
+        uens_input = st.text_area(
+            "Enter your list of UENs (separated by commas):",
+            value="",
+            height=90,
+            placeholder="199403976M, 53146389C",
+        )
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            demerit_threshold = st.number_input(
+                "Demerit points less than",
+                min_value=0,
+                value=defaults["demerit_threshold"],
+                step=1,
+            )
+        with col2:
+            exclude_bus = st.checkbox("Exclude companies under BUS", value=defaults["exclude_bus"])
+        with col3:
+            st.caption("Fields are based on the MOM PDFs only.")
+
+        submitted = st.form_submit_button("Run Scraper")
 
     if not submitted:
         return
@@ -694,7 +613,10 @@ def render_app() -> None:
         st.warning("Please enter at least one UEN.")
         return
 
-    criteria = FILTER_CONFIG
+    criteria = {
+        "demerit_threshold": int(demerit_threshold),
+        "exclude_bus": exclude_bus,
+    }
 
     pdf_info = pdf_bundle["pdf_info"]
     with st.spinner("Parsing MOM PDFs..."):
@@ -734,7 +656,6 @@ def render_app() -> None:
 
     st.subheader("Criteria applied")
     st.write(results["criteria_checks"])
-    st.caption("Grading is computed from the enabled rules above. PASS means every enabled rule passed; FAIL means at least one rule failed.")
 
     st.caption(
         "Demerit points shown as 0 mean the UEN was not found in the demerit points PDF. However, it may still be found in the BUS or SWO PDFs, which can be checked in the respective columns. Notes explain which criteria were not met based on the PDF data only."
