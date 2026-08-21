@@ -672,7 +672,7 @@ def render_app() -> None:
         st.warning("Download warnings:")
         for err in pdf_bundle["errors"]:
             st.write(f"- {err}")
-    st.write("Note: The SWO output table column is broken, so SWO counts will be inaccurate. The column is removed to avoid confusion.")
+    st.write("Note: The SWO output table column is broken, so SWO counts will be inaccurate. The column is removed to avoid confusion. Go to the SWO PDF to check count or use pcg-webscraper-2.streamlit.app instead.")
     uens_input = st.text_area(
         "Enter your list of UENs (separated by commas):",
         value="",

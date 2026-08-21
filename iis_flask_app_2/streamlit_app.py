@@ -183,7 +183,7 @@ def render_app() -> None:
         )
         uens_input = st.text_area(
             "UENs",
-            placeholder="199403976M, 53146389C",
+            placeholder="e.g. 199403976M, 53146389C or leave blank to skip lookup",
             help="Separate multiple UENs with commas, spaces, or new lines.",
             height=90,
         )
