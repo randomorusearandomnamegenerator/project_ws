@@ -615,7 +615,7 @@ def format_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
                 "Debarment Phase/Period": format_cell(row.get("debarment")),
                 "Is under BUS": format_cell(row.get("is_under_bus")),
                 "BUS Entry Date": format_cell(row.get("bus_entry_date")),
-                "SWO Count": format_cell(row.get("swo_count")),
+                #"SWO Count": format_cell(row.get("swo_count")),
                 #"Grade": format_cell(row.get("grade")),
                 "Notes": format_cell(row.get("notes")),
             }
