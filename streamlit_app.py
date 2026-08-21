@@ -672,7 +672,7 @@ def render_app() -> None:
         st.warning("Download warnings:")
         for err in pdf_bundle["errors"]:
             st.write(f"- {err}")
-
+    st.write("Note: The SWO output table column is broken, so SWO counts will be inaccurate. The column is removed to avoid confusion.")
     uens_input = st.text_area(
         "Enter your list of UENs (separated by commas):",
         value="",

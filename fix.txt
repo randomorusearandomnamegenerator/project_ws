@@ -1,0 +1,9 @@
+Flask==3.1.3          # patched info disclosure
+requests==2.33.0      # patched credential leakage + temp file vuln
+beautifulsoup4==4.14.3 # safe release after malware compromise
+waitress==3.0.2       # patched race condition
+pypdf==6.14.2          # replacing vulnerable PyPDF2
+cryptography==48.0.1  # patched GHSA-537c-gmf6-5ccf
+idna==3.15            # patched DoS vuln
+urllib3==2.7.0        # patched DoS + info disclosure
+nltk==3.9.4           # patched release (when available)

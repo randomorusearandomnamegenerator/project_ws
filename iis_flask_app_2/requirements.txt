@@ -1,0 +1,10 @@
+Flask==3.0.3
+camelot-py==0.11.0
+pypdf==6.14.2
+requests==2.33.0
+urllib3==2.6.2
+charset-normalizer==3.3.2
+beautifulsoup4==4.12.3
+streamlit==1.36.0
+waitress==3.0.0
+opencv-python-headless==4.10.0.84
